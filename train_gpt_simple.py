@@ -180,18 +180,157 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True):
+def muon_update(grad, momentum, mu=0.95, nesterov=True, prenorm=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
-    update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    if prenorm:
+        update = update / (update.square().mean(dim=-1, keepdim=True).sqrt() + 1e-8)  # pre-NS row norm
+    update = zeropower_via_newtonschulz5(update).float()
+    update *= max(1, max(grad.size(-2), grad.size(-1)) / min(grad.size(-2), grad.size(-1)))**0.5
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, lr_mults=None, qkv_groups=(), mu_overrides=None):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        super().__init__(params, defaults)
+        self.lr_mults = lr_mults or {}
+        self.mu_overrides = mu_overrides or {}
+        self.prenorm_skips = set()
+        self.cooldown_overrides = {}
+        self.eta_mults = {}
+        self.perhead = set()  # params orthogonalized per attention head
+        self.wd_mults = {}
+        # items = independent update units: either a single param or a list of params
+        # whose grads are stacked (rows dim) and orthogonalized jointly (e.g. q,k,v)
+        grouped = {p for g in qkv_groups for p in g}
+        items = [[p] for p in params if p not in grouped] + [list(g) for g in qkv_groups]
+        items.sort(key=lambda ps: -sum(p.numel() for p in ps))
+        self.items = items
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        group = self.param_groups[0]
+        items = self.items
+        assert len(items) % world_size == 0, f"{len(items)} items not divisible by world_size {world_size}"
+        for base_i in range(0, len(items), world_size):
+            round_items = items[base_i:base_i + world_size]
+            max_numel = max(sum(p.numel() for p in it) for it in round_items)
+            mine = round_items[rank]
+            if mine:
+                key = mine[0]
+                state = self.state[key]
+                rows = sum(p.size(-2) for p in mine)
+                cols = mine[0].size(-1)
+                perhead = key in self.perhead and len(mine) == 1
+                nheads = 6
+                if len(state) == 0:
+                    mom_shape = (nheads, rows // nheads, cols) if perhead else (rows, cols)
+                    state["momentum"] = torch.zeros(mom_shape, device=key.device, dtype=torch.float32)
+
+                g = torch.cat([p.grad.float() for p in mine], dim=-2) if len(mine) > 1 else mine[0].grad
+                if perhead:
+                    g = g.view(nheads, rows // nheads, cols)
+                update = muon_update(g, state["momentum"],
+                                     mu=self.mu_overrides.get(key, group["mu"]),
+                                     prenorm=key not in self.prenorm_skips)
+                if perhead:
+                    update = update.view(rows, cols)
+                mult = self.lr_mults.get(key, 1.0) * self.eta_mults.get(key, 1.0)
+                offset = 0
+                for p in mine:
+                    n = p.size(-2)
+                    p.mul_(1 - group["lr"] * mult * group["weight_decay"])
+                    p.add_(update[offset:offset + n], alpha=-group["lr"] * mult)
+                    offset += n
+                send = torch.cat([p.detach().flatten() for p in mine])
+                send = torch.cat([send, send.new_zeros(max_numel - send.numel())])
+            else:
+                send = torch.zeros(max_numel, device="cuda")
+            recv = [torch.empty(max_numel, device=send.device, dtype=send.dtype) for _ in range(world_size)]
+            dist.all_gather(recv, send)
+            for j, it in enumerate(round_items):
+                if j == rank or not it:
+                    continue
+                offset = 0
+                for p in it:
+                    n = p.numel()
+                    p.data.copy_(recv[j][offset:offset + n].view_as(p))
+                    offset += n
+
+
+@torch.compile
+def fp32_adam_update(g, m, v, bc1, bc2, beta1, beta2, eps):
+    # classic AdamW direction, all state/compute in fp32 (fused keeps bf16 for bf16 params)
+    m.lerp_(g, 1 - beta1)
+    v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+    return (m / bc1) / ((v / bc2).sqrt() + eps)
+
+class Fp32AdamW(torch.optim.Optimizer):
+    """AdamW with fp32 states (for the bf16 embedding table, whose fused states are bf16).
+    Params are replicated across ranks — every rank updates identically, no gather."""
+
+    def __init__(self, params, lr=0.002, betas=(0.8, 0.99), eps=1e-8, weight_decay=0.001):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            for p in group["params"]:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["m"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["v"] = torch.zeros_like(p, dtype=torch.float32)
+                state["step"] += 1
+                t = state["step"]
+                bc1 = torch.tensor(1 - beta1 ** t, device=p.device)
+                bc2 = torch.tensor(1 - beta2 ** t, device=p.device)
+                update = fp32_adam_update(g.float(), state["m"], state["v"], bc1, bc2, beta1, beta2, eps)
+                master = getattr(self, "master_weight", None)
+                if master is not None:
+                    # mixed-precision master weights: accumulate in fp32, cast to bf16 for the model
+                    master.mul_(1 - group["lr"] * group["weight_decay"])
+                    master.add_(update, alpha=-group["lr"])
+                    p.data.copy_(master.to(p.dtype))
+                else:
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update.to(p.dtype), alpha=-group["lr"])
+
+
+@torch.compile
+def soap_update(g, m, v, QL, QR, bc1, bc2, beta1, beta2, eps):
+    # project the gradient into the Shampoo eigenbasis
+    g_proj = QR.mT @ g @ QL
+    # Adam update in the eigenbasis
+    m.lerp_(g_proj, 1 - beta1)
+    v.mul_(beta2).addcmul_(g_proj, g_proj, value=1 - beta2)
+    update_proj = (m / bc1) / ((v / bc2).sqrt() + eps)
+    # project back to the original basis
+    return QR @ update_proj @ QL.mT
+
+class SOAP(torch.optim.Optimizer):
+    """SOAP: Shampoo Kronecker preconditioner with Adam run in the eigenbasis.
+
+    Distributed across ranks exactly like Muon: each rank owns a shard of the
+    params, maintains that shard's preconditioner state, and updated params are
+    all-gathered. The eigenbasis is refreshed every `precond_freq` steps.
+    """
+    def __init__(self, params, lr=0.003, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0,
+                 precond_freq=10, shampoo_beta=0.95):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                        precond_freq=precond_freq, shampoo_beta=shampoo_beta)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -201,15 +340,39 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            beta1, beta2 = group["betas"]
+            sb = group["shampoo_beta"]
+            freq = group["precond_freq"]
+            eps = group["eps"]
             for base_i in range(0, len(params), world_size):
                 if base_i + rank < len(params):
                     p = params[base_i + rank]
+                    g = p.grad.float()
                     state = self.state[p]
                     if len(state) == 0:
-                        state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                        state["step"] = 0
+                        rows, cols = g.shape
+                        state["LL"] = torch.zeros(cols, cols, device=g.device, dtype=torch.float32)
+                        state["RR"] = torch.zeros(rows, rows, device=g.device, dtype=torch.float32)
+                        state["QL"] = torch.eye(cols, device=g.device, dtype=torch.float32)
+                        state["QR"] = torch.eye(rows, device=g.device, dtype=torch.float32)
+                        state["m"] = torch.zeros_like(g)
+                        state["v"] = torch.zeros_like(g)
+                    state["step"] += 1
+                    t = state["step"]
+                    # EMA update of the Shampoo Kronecker factors
+                    state["LL"].mul_(sb).add_(g.mT @ g, alpha=1 - sb)   # G^T G  (in x in)
+                    state["RR"].mul_(sb).add_(g @ g.mT, alpha=1 - sb)   # G G^T  (out x out)
+                    # periodic refresh of the eigenbasis
+                    if t % freq == 0:
+                        state["QL"] = torch.linalg.eigh(state["LL"])[1]
+                        state["QR"] = torch.linalg.eigh(state["RR"])[1]
+                    bc1 = torch.tensor(1 - beta1 ** t, device=g.device)
+                    bc2 = torch.tensor(1 - beta2 ** t, device=g.device)
+                    update = soap_update(g, state["m"], state["v"], state["QL"], state["QR"],
+                                         bc1, bc2, beta1, beta2, eps)
                     p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    p.add_(update.to(p.dtype), alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
@@ -278,7 +441,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 2968  # CONFIRM stack24 @2968 (8-trial record attempt)
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -289,7 +452,7 @@ for trial_idx in range(num_trials):
             elif "embed" in name:
                 w.normal_()  # default torch init
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 * 1.4 / w.size(-1)**0.5)  # 1.4x init scale (best)
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -298,13 +461,23 @@ for trial_idx in range(num_trials):
             raise Exception(f"Uninitialized parameter: {name}")
 
     # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
+    optimizer0 = Fp32AdamW([dict(params=[model.embed.weight], lr=0.85, betas=(0.7, 0.99))],
+                           betas=(0.8, 0.99), eps=1e-8, weight_decay=0.001)
+    optimizer0.master_weight = model.embed.weight.detach().float().clone()
+    optimizer1 = AdamW([dict(params=[model.proj.weight], lr=0.0045, cooldown=0.65),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
-    optimizers = [optimizer1, optimizer2]
+                       betas=(0.8, 0.99), eps=1e-8, weight_decay=0.001, fused=True)
+    _muon_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
+    optimizer2 = Muon(_muon_params, lr=0.025, weight_decay=0.05,
+                      lr_mults={block.mlp.fc.weight: 1.5 for block in model.blocks}
+                      | {block.mlp.proj.weight: 1.25 for block in model.blocks}
+                      | {p: 0.75 for block in model.blocks
+                         for p in [block.attn.q.weight, block.attn.k.weight, block.attn.v.weight]}
+                      | {block.attn.proj.weight: 0.55 for block in model.blocks},
+                      mu_overrides={})
+    optimizer2.prenorm_skips = set()
+    optimizer2.perhead = set()
+    optimizers = [optimizer0, optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
@@ -329,13 +502,24 @@ for trial_idx in range(num_trials):
     def set_hparams(step, cooldown_frac=0.7):
         progress = step / train_steps
         assert 0 <= progress < 1
-        if progress < 1 - cooldown_frac:
-            eta = 1.0
-        else:
-            eta = (1 - progress) / cooldown_frac
+        # Muon momentum warmup: 0.85 -> 0.96 over the first 300 steps
+        # (discrete values so the compiled muon_update is not re-traced every step)
+        mu = 0.85 if step < 75 else 0.875 if step < 150 else 0.9 if step < 225 else 0.925 if step < 300 else 0.96
         for opt in optimizers:
             for group in opt.param_groups:
+                cf = group.get("cooldown", cooldown_frac)  # per-group cooldown override
+                fl = group.get("floor", 0.035)  # per-group lr floor override
+                eta = 1.0 if progress < 1 - cf else max((1 - progress) / cf, fl)
                 group["lr"] = group["initial_lr"] * eta
+                if "mu" in group:
+                    group["mu"] = mu
+                # per-param cooldown overrides: store relative eta multiplier
+                if getattr(opt, "cooldown_overrides", None):
+                    fl_over = getattr(opt, "floor_overrides", {})
+                    for p, cf_p in opt.cooldown_overrides.items():
+                        fl_p = fl_over.get(p, fl)
+                        eta_p = 1.0 if progress < 1 - cf_p else max((1 - progress) / cf_p, fl_p)
+                        opt.eta_mults[p] = eta_p / eta
 
 
     ########################################
@@ -404,4 +588,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-

@@ -51,3 +51,4 @@ entry under `records/`, and documents the method, the diff against the baseline,
 | # | Record | Description | Date | Log |
 |---|--------|-------------|------|-----|
 | 1 | 3,290 steps | Baseline (Muon + aux AdamW, tuned) | 2026-07-08 | — |
+| . | 2,968 steps | Kimi K3 | 2026-07-28 | [record](records/2026-07-28_kimi-k3/README.md) |
