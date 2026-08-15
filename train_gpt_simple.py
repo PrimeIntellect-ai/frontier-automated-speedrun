@@ -170,7 +170,7 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations, not optimizing for wallclock speed
     a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
+    for _ in range(18):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -180,12 +180,18 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True):
+def muon_update(grad, momentum, second, second_post, t, mu, scale: float, e=None, beta2=0.91, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
-    update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
+    # pre-NS neuron-wise normalization: precondition the momentum rows by their
+    # RMS EMA before orthogonalization
+    b2 = e  # time-varying pre-NS beta2, set by the schedule
+    row_ms = update.square().mean(dim=-1, keepdim=True)
+    second.lerp_(row_ms, 1 - b2)
+    v_hat = second / (1 - b2 ** t)
+    update = update / (v_hat.sqrt() + 1e-8)
+    normed = zeropower_via_newtonschulz5(update).float()
+    return normed * scale
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
@@ -198,6 +204,8 @@ class Muon(torch.optim.Optimizer):
     def step(self):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
+        self._t = getattr(self, "_t", 0) + 1
+        t_t = torch.tensor(float(self._t), dtype=torch.float32, device="cuda")
         for group in self.param_groups:
             params = group["params"]
             params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
@@ -207,10 +215,156 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                        state["second"] = torch.zeros_like(p[..., :1])
+                        state["second_post"] = torch.zeros_like(p[..., :1])
+                    mu_t = torch.tensor(group["mu"], dtype=torch.float32, device=p.device)
+                    if p in getattr(self, "_headwise", ()):
+                        # orthogonalize per attention-head block (head_dim=128)
+                        g = p.grad.view(-1, 128, p.shape[-1])
+                        mom = state["momentum"].view_as(g)
+                        sec = state["second"].view(g.shape[0], g.shape[1], 1)
+                        scale = 1.0
+                    else:
+                        g, mom, sec = p.grad, state["momentum"], state["second"]
+                        scale = max(p.shape[-2] / p.shape[-1], p.shape[-1] / p.shape[-2])**0.5
+                    e_t = torch.tensor(group.get("prens_exp", 0.5), dtype=torch.float32, device=p.device)
+                    update = muon_update(g, mom, sec, state["second_post"].view_as(sec), t_t, mu_t, scale, e_t).reshape(p.shape)
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+
+@torch.compile
+def soap_update(grad, m, v, L, R, QL, QR, t, beta1=0.95, beta2=0.95, shampoo_beta=0.95):
+    g = grad.float()
+    L.lerp_(g @ g.mT, 1 - shampoo_beta)
+    R.lerp_(g.mT @ g, 1 - shampoo_beta)
+    m.lerp_(g, 1 - beta1)
+    gp = QL.mT @ g @ QR
+    mp = QL.mT @ (m / (1 - beta1 ** t)) @ QR
+    v.lerp_(gp.square(), 1 - beta2)
+    vh = v / (1 - beta2 ** t)
+    up = mp / (vh.sqrt() + 1e-8)
+    upd = QL @ up @ QR.mT
+    # normalize to unit RMS so lr sets the weight-delta scale directly
+    return upd / (upd.square().mean().sqrt() + 1e-12)
+
+class SOAP(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.001, weight_decay=0.05, precond_freq=25):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, precond_freq=precond_freq)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        self._t = getattr(self, "_t", 0) + 1
+        t_t = torch.tensor(float(self._t), dtype=torch.float32, device="cuda")
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        rows, cols = p.shape[-2], p.shape[-1]
+                        state["m"] = torch.zeros_like(p, dtype=torch.float32)
+                        state["v"] = torch.zeros_like(p, dtype=torch.float32)
+                        state["L"] = torch.zeros(rows, rows, dtype=torch.float32, device=p.device)
+                        state["R"] = torch.zeros(cols, cols, dtype=torch.float32, device=p.device)
+                        state["QL"] = torch.eye(rows, dtype=torch.float32, device=p.device)
+                        state["QR"] = torch.eye(cols, dtype=torch.float32, device=p.device)
+                    update = soap_update(p.grad, state["m"], state["v"], state["L"], state["R"],
+                                         state["QL"], state["QR"], t_t)
+                    if self._t == 1 or self._t % group["precond_freq"] == 0:
+                        state["QL"].copy_(torch.linalg.eigh(state["L"])[1])
+                        state["QR"].copy_(torch.linalg.eigh(state["R"])[1])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+
+class Lookahead:
+    """Slow-weight averaging fed back into training: every k steps,
+    slow += alpha*(fast - slow); fast <- slow."""
+    def __init__(self, params, k=6, alpha=0.5):
+        self.params = list(params)
+        self.k = k
+        self.alpha = alpha
+        self.t = 0
+        self.slow = None
+        self.param_groups = []
+
+    @torch.no_grad()
+    def step(self):
+        self.t += 1
+        if self.slow is None:
+            self.slow = [p.detach().float().clone() for p in self.params]
+        if self.t % self.k == 0:
+            for s, p in zip(self.slow, self.params):
+                s.lerp_(p.detach().float(), self.alpha)
+                p.detach().copy_(s.type_as(p))
+
+
+@torch.compile
+def adam_fp32_step(p, grad, m, v, t, lr, wd, beta1=0.8, beta2=0.95, eps=1e-10):
+    g = grad.float()
+    m.lerp_(g, 1 - beta1)
+    v.lerp_(g.square(), 1 - beta2)
+    # Nesterov-style momentum blend (NAdam)
+    m_hat = (beta1 * m + (1 - beta1) * g) / (1 - beta1 ** t)
+    upd = m_hat / ((v / (1 - beta2 ** t)).sqrt() + eps)
+    p.mul_(1 - lr * wd)
+    p.add_((upd * lr).type_as(p), alpha=-1)
+
+class AdamFP32(torch.optim.Optimizer):
+    """Nesterov-AdamW with fp32 moments regardless of parameter dtype."""
+    def __init__(self, params, lr, weight_decay=0.001):
+        super().__init__(params, dict(lr=lr, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if len(state) == 0:
+                    state["m"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["v"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["t"] = torch.zeros((), dtype=torch.float32, device=p.device)
+                state["t"] += 1
+                lr_t = torch.tensor(group["lr"], dtype=torch.float32, device=p.device)
+                wd_t = torch.tensor(group["weight_decay"], dtype=torch.float32, device=p.device)
+                adam_fp32_step(p, p.grad, state["m"], state["v"], state["t"], lr_t, wd_t)
+
+
+class FinalEMA:
+    """Maintains an EMA of the weights and folds it into the model on the last step.
+    Pure optimizer-side weight averaging (no validation involvement)."""
+    def __init__(self, params, total_steps, decay=0.995, start=0):
+        self.params = list(params)
+        self.total = total_steps
+        self.decay = decay
+        self.start = start
+        self.t = 0
+        self.shadow = None
+        self.param_groups = []
+
+    @torch.no_grad()
+    def step(self):
+        self.t += 1
+        if self.t < self.start:
+            return
+        if self.shadow is None:
+            self.shadow = [p.detach().float().clone() for p in self.params]
+        else:
+            for s, p in zip(self.shadow, self.params):
+                s.lerp_(p.detach().float(), 1 - self.decay)
+        if self.t == self.total:
+            for s, p in zip(self.shadow, self.params):
+                p.detach().copy_(s.type_as(p))
 
 
 ########################################
@@ -278,7 +432,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 2726
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -289,7 +443,9 @@ for trial_idx in range(num_trials):
             elif "embed" in name:
                 w.normal_()  # default torch init
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                # orthogonal init, gain matched to row-norm of N(0, 0.33/fan_in)
+                torch.nn.init.orthogonal_(w, gain=(0.33 * w.size(-2) / w.size(-1))**0.5
+                                          if w.size(-2) >= w.size(-1) else 0.33**0.5)
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -300,11 +456,25 @@ for trial_idx in range(num_trials):
     # create the optimizer(s)
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
                         dict(params=[model.proj.weight], lr=0.004),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
-    optimizers = [optimizer1, optimizer2]
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.035,
+                             weight_decay=0.0)],
+                       betas=(0.8, 0.98), eps=1e-10, weight_decay=0.001, fused=True)
+    optimizer2 = Muon([p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "attn" in n],
+                      lr=0.029, weight_decay=0.05)
+    optimizer2._wd_amp = 0.08
+    optimizer2._wd_exp = 2.25
+    mlp_depth_amps = ((0.16, 0, 4), (0.22, 4, 8), (0.28, 8, 12))
+    mlp_opts = []
+    for amp, lo, hi in mlp_depth_amps:
+        opt = Muon([p for n, p in model.blocks.named_parameters()
+                    if p.ndim >= 2 and "mlp" in n and lo <= int(n.split(".")[0]) < hi],
+                   lr=0.027, weight_decay=0.05)
+        opt._wd_amp = amp
+        opt._wd_exp = 2.5
+        mlp_opts.append(opt)
+    muon_opts = [optimizer2] + mlp_opts
+    optimizers = [optimizer1, optimizer2] + mlp_opts + [
+                  FinalEMA(model.parameters(), total_steps=train_steps, decay=0.9935)]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
@@ -333,9 +503,20 @@ for trial_idx in range(num_trials):
             eta = 1.0
         else:
             eta = (1 - progress) / cooldown_frac
+        eta = max(eta, 0.20)
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
+        for gi, group in enumerate(optimizer1.param_groups):
+            group["betas"] = (0.99 if gi == 2 else 0.8, 0.965 + 0.034 * progress)
+        # Muon momentum warmup: 0.85 -> 0.96 over the first 350 steps
+        frac = min(step / 350, 1.0)
+        for opt in muon_opts:
+            for group in opt.param_groups:
+                group["mu"] = 0.85 * (1 - frac) + 0.96 * frac
+                group["prens_exp"] = (0.84 if opt is optimizer2 else 0.86) + 0.10 * progress
+                group["weight_decay"] = (getattr(opt, "_wd_amp", 0.14)
+                                         * (1 - progress) ** getattr(opt, "_wd_exp", 2.0))
 
 
     ########################################
@@ -404,4 +585,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-
