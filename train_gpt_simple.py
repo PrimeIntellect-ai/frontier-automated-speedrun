@@ -160,7 +160,8 @@ class GPT(nn.Module):
 #              Optimizer               #
 ########################################
 
-def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5) -> Tensor:
+    """Orthogonalize via Newton–Schulz. Better quintic coeffs -> fewer iters."""
     assert G.ndim >= 2
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
@@ -168,9 +169,10 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations, not optimizing for wallclock speed
-    a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
+    # Coefficients for the quintic polynomial that maximizes slope at 0
+    # while staying stable on [0, 1] (standard Muon / polar-factorization coeffs).
+    a, b, c = 3.5, -4.9, 2.1
+    for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -180,18 +182,18 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True):
+def muon_update(grad, momentum, mu=0.95, nesterov=True, ns_steps=5):
     momentum.lerp_(grad, 1 - mu)
-    update = grad.lerp_(momentum, mu) if nesterov else momentum
-    update = zeropower_via_newtonschulz5(update)
+    update = grad.lerp(momentum, mu) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, ns_steps=5, nesterov=True):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, ns_steps=ns_steps, nesterov=nesterov)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -207,10 +209,12 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"],
+                                         nesterov=group["nesterov"], ns_steps=group["ns_steps"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
 
 
 ########################################
@@ -277,8 +281,11 @@ for trial_idx in range(num_trials):
     ########################################
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
-    # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    # E208: n=8 pure E200 @3126 (E207 seed0 3.27746 step-record attempt).
+    # E193 stack: split 0.023/0.027, WD peak 0.062, NS 3.5/-4.9/2.1,
+    # WD eta**2 floor 0.15, LR floor 0.02, cooldown 0.7, Adam betas (0.8,0.99).
+    # E260: E258 stack @3120 half-cut screen
+    train_steps = 3120
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -297,19 +304,24 @@ for trial_idx in range(num_trials):
         else:
             raise Exception(f"Uninitialized parameter: {name}")
 
-    # create the optimizer(s)
+    # create the optimizer(s) — E193 record stack
+    max_grad_norm = None
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
                         dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
-    optimizers = [optimizer1, optimizer2]
+                       betas=(0.8, 0.99), eps=1e-10, weight_decay=0.001, fused=True)
+    attn_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "attn" in n]
+    mlp_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "mlp" in n]
+    assert set(attn_params) | set(mlp_params) == {p for p in model.blocks.parameters() if p.ndim >= 2}
+    optimizer2 = Muon(attn_params, lr=0.021, weight_decay=0.062, mu=0.95, ns_steps=5, nesterov=True)
+    optimizer3 = Muon(mlp_params, lr=0.029, weight_decay=0.062, mu=0.95, ns_steps=5, nesterov=True)
+    optimizers = [optimizer1, optimizer2, optimizer3]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
+            group["initial_weight_decay"] = group.get("weight_decay", 0)
 
     # W&B run for this trial (fixed logging infra; no-op if W&B unconfigured)
     wandb_run = None
@@ -325,7 +337,7 @@ for trial_idx in range(num_trials):
             print0(f"wandb disabled: {e}", console=True)
             wandb_run = None
 
-    # learning rate schedule: stable then decay
+    # LR linear cooldown floor 0.02; WD anneals with eta**2 floor 0.15 (E193).
     def set_hparams(step, cooldown_frac=0.7):
         progress = step / train_steps
         assert 0 <= progress < 1
@@ -333,9 +345,17 @@ for trial_idx in range(num_trials):
             eta = 1.0
         else:
             eta = (1 - progress) / cooldown_frac
+        lr_eta = max(eta, 0.02)
+        eta_wd = eta * eta
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+                group["lr"] = group["initial_lr"] * lr_eta
+                if "initial_weight_decay" in group:
+                    floor = 0.15
+                    group["weight_decay"] = group["initial_weight_decay"] * (floor + (1 - floor) * eta_wd)
+
+
+
 
 
     ########################################
@@ -404,4 +424,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-
