@@ -168,9 +168,8 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations, not optimizing for wallclock speed
-    a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(5):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -278,7 +277,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3234
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -301,7 +300,7 @@ for trial_idx in range(num_trials):
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
                         dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+                       betas=(0.8, 0.985), eps=1e-10, weight_decay=0.001, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
                       lr=0.025, weight_decay=0.05)
     optimizers = [optimizer1, optimizer2]
