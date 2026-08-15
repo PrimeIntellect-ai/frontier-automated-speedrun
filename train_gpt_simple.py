@@ -188,10 +188,10 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, nesterov=True):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, nesterov=nesterov)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -207,10 +207,51 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"], nesterov=group["nesterov"])
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+@torch.compile
+def lion_update(grad, exp_avg, beta1=0.95, beta2=0.98):
+    # interpolate for update, then sign
+    update = exp_avg.lerp(grad, 1 - beta1)
+    # sign update
+    update = update.sign()
+    # momentum update
+    exp_avg.lerp_(grad, 1 - beta2)
+    return update
+
+class Lion(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-4, betas=(0.95, 0.98), weight_decay=0.0):
+        assert isinstance(params, list) or isinstance(params, tuple) or hasattr(params, '__iter__')
+        # flatten list handling: support list of params or list of dicts
+        if isinstance(params, list) and len(params)>0 and isinstance(params[0], dict):
+            # param groups
+            super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
+        else:
+            # single group
+            super().__init__([dict(params=list(params), lr=lr, betas=betas, weight_decay=weight_decay)], dict(lr=lr, betas=betas, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            beta1, beta2 = group["betas"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(p)
+                exp_avg = state["exp_avg"]
+                # weight decay (decoupled, scaled by lr as in AdamW)
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+                update = lion_update(grad, exp_avg, beta1, beta2)
+                p.add_(update, alpha=-lr)
 
 
 ########################################
@@ -278,18 +319,18 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3230
 
-    # initialize model parameters
+    # initialize model parameters — baseline
     for name, p in model.named_parameters():
         w = p.data
         if name.endswith("weight"):
             if "proj" in name:
                 w.zero_()
             elif "embed" in name:
-                w.normal_()  # default torch init
+                w.normal_()
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -297,14 +338,16 @@ for trial_idx in range(num_trials):
         else:
             raise Exception(f"Uninitialized parameter: {name}")
 
-    # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
+    # create the optimizer(s) — v16: split Muon attn vs mlp (best)
+    attn_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "attn" in n]
+    mlp_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "mlp" in n]
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.70),
                         dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
-    optimizers = [optimizer1, optimizer2]
+    optimizer2 = Muon(attn_params, lr=0.028, weight_decay=0.04, mu=0.95)
+    optimizer3 = Muon(mlp_params, lr=0.036, weight_decay=0.04, mu=0.95)
+    optimizers = [optimizer1, optimizer2, optimizer3]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
@@ -325,7 +368,7 @@ for trial_idx in range(num_trials):
             print0(f"wandb disabled: {e}", console=True)
             wandb_run = None
 
-    # learning rate schedule: stable then decay
+    # learning rate schedule: stable then decay (baseline)
     def set_hparams(step, cooldown_frac=0.7):
         progress = step / train_steps
         assert 0 <= progress < 1
