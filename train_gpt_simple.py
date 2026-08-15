@@ -183,6 +183,12 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
 def muon_update(grad, momentum, mu=0.95, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
+    row_rms = update.square().mean(dim=-1, keepdim=True).sqrt()
+    global_rms = update.square().mean().sqrt()
+    update *= global_rms / (row_rms + 1e-7)
+    col_rms = update.square().mean(dim=-2, keepdim=True).sqrt()
+    global_rms = update.square().mean().sqrt()
+    update *= global_rms / (col_rms + 1e-7)
     update = zeropower_via_newtonschulz5(update)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
@@ -278,7 +284,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3110
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -289,7 +295,7 @@ for trial_idx in range(num_trials):
             elif "embed" in name:
                 w.normal_()  # default torch init
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -299,17 +305,19 @@ for trial_idx in range(num_trials):
 
     # create the optimizer(s)
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
+                        dict(params=[model.proj.weight], lr=0.003),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
+                      lr=0.025, weight_decay=0.05, mu=0.95)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
+            if opt is optimizer2:
+                group["schedule_power"] = 1.2
 
     # W&B run for this trial (fixed logging infra; no-op if W&B unconfigured)
     wandb_run = None
@@ -327,7 +335,7 @@ for trial_idx in range(num_trials):
 
     # learning rate schedule: stable then decay
     def set_hparams(step, cooldown_frac=0.7):
-        progress = step / train_steps
+        progress = step / 3140
         assert 0 <= progress < 1
         if progress < 1 - cooldown_frac:
             eta = 1.0
@@ -335,7 +343,7 @@ for trial_idx in range(num_trials):
             eta = (1 - progress) / cooldown_frac
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+                group["lr"] = group["initial_lr"] * eta ** group.get("schedule_power", 1.0)
 
 
     ########################################
