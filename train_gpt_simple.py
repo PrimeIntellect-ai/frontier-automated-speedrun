@@ -161,16 +161,15 @@ class GPT(nn.Module):
 ########################################
 
 def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    # Polar Express quintic: better polar-factor approx than classic NS (2,-1.5,0.5).
     assert G.ndim >= 2
     X = G.bfloat16()
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations, not optimizing for wallclock speed
-    a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(5):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -186,6 +185,7 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     update = zeropower_via_newtonschulz5(update)
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
+
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
@@ -278,7 +278,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3220
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -310,6 +310,7 @@ for trial_idx in range(num_trials):
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
+            group["initial_wd"] = group.get("weight_decay", 0.0)
 
     # W&B run for this trial (fixed logging infra; no-op if W&B unconfigured)
     wandb_run = None
@@ -325,7 +326,7 @@ for trial_idx in range(num_trials):
             print0(f"wandb disabled: {e}", console=True)
             wandb_run = None
 
-    # learning rate schedule: stable then decay
+    # learning rate schedule: stable then linear decay
     def set_hparams(step, cooldown_frac=0.7):
         progress = step / train_steps
         assert 0 <= progress < 1
@@ -336,6 +337,7 @@ for trial_idx in range(num_trials):
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
+                group["weight_decay"] = group["initial_wd"] * eta
 
 
     ########################################
@@ -404,4 +406,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-
