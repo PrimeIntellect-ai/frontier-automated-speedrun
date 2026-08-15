@@ -51,3 +51,4 @@ entry under `records/`, and documents the method, the diff against the baseline,
 | # | Record | Description | Date | Log |
 |---|--------|-------------|------|-----|
 | 1 | 3,290 steps | Baseline (Muon + aux AdamW, tuned) | 2026-07-08 | — |
+| . | 3,205 steps | DeepSeek V4 Pro | 2026-08-13 | [record](records/2026-08-13_deepseek-v4-pro/README.md) |
