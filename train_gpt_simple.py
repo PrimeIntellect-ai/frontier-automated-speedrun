@@ -278,7 +278,21 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3205
+
+    # schedule knobs: two-segment lr decay
+    #   segment 1: eta 1 -> eta_mid over steps [0, mid_steps), shape eta = 1-(1-eta_mid)*(s/mid_steps)**mid_power
+    #   segment 2: eta eta_mid -> 0 over steps [mid_steps, train_steps), shape
+    #   eta = eta_mid * ((T-s)/(T-S))**decay_power
+    #   (eta_mid=1.0, mid_power=1.0, decay_power=1.0 -> stable at eta=1 for mid_steps, then
+    #    linear to 0 = the baseline's exact decay profile)
+    warmup_steps = 0
+    mid_steps = 957
+    eta_mid = 1.0
+    mid_power = 1.0
+    decay_power = 1.0  # decay-segment shape: 1.0 linear, 0.5 sqrt (hot mid-decay, fast end drop)
+    lr_floor = 0.0      # decay floor, as a fraction of initial lr
+    adam_floor = 0.05   # eta floor for the AdamW groups only: embed keeps settling while Muon decays to 0
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -289,7 +303,7 @@ for trial_idx in range(num_trials):
             elif "embed" in name:
                 w.normal_()  # default torch init
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                w.normal_(std=1.0 / w.size(-1)**0.5)  # default torch init
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -300,8 +314,8 @@ for trial_idx in range(num_trials):
     # create the optimizer(s)
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
                         dict(params=[model.proj.weight], lr=0.004),
-                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.02)],
+                       betas=(0.8, 0.99), eps=1e-10, weight_decay=0.001, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
                       lr=0.025, weight_decay=0.05)
     optimizers = [optimizer1, optimizer2]
@@ -325,17 +339,22 @@ for trial_idx in range(num_trials):
             print0(f"wandb disabled: {e}", console=True)
             wandb_run = None
 
-    # learning rate schedule: stable then decay
-    def set_hparams(step, cooldown_frac=0.7):
-        progress = step / train_steps
-        assert 0 <= progress < 1
-        if progress < 1 - cooldown_frac:
-            eta = 1.0
+    # learning rate schedule: warmup, then two-segment decay (absolute step counts)
+    def set_hparams(step):
+        if step < warmup_steps:
+            eta = (step + 1) / warmup_steps
+        elif step < mid_steps:
+            eta = 1.0 - (1.0 - eta_mid) * (step / mid_steps) ** mid_power
         else:
-            eta = (1 - progress) / cooldown_frac
+            u = (train_steps - step) / (train_steps - mid_steps)
+            eta = eta_mid * u ** decay_power
+            eta = max(eta, lr_floor)
         for opt in optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+                if opt is optimizer1:
+                    group["lr"] = group["initial_lr"] * max(eta, adam_floor)
+                else:
+                    group["lr"] = group["initial_lr"] * eta
 
 
     ########################################
