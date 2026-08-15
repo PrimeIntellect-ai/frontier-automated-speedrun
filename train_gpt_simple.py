@@ -169,8 +169,9 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations, not optimizing for wallclock speed
-    a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
+    # High-slope quintic iteration gives a useful approximate polar factor.
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(5):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -180,18 +181,40 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True):
+def muon_update(grad, momentum, variance, col_variance, mu=0.95,
+                beta2=0.95, col_beta2=0.95, attn_beta2=0.95, nesterov_mu=0.95):
+    if grad.size(-2) != grad.size(-1):
+        variance.lerp_(grad.float().square().mean(dim=-1, keepdim=True), 1 - beta2)
+        grad = grad / (variance.sqrt() + 1e-8)
+        # Partially whiten the residual column anisotropy after the proven row
+        # normalization. A fourth root preserves more of Muon's matrix geometry
+        # than full factored RMS normalization.
+        col_variance.lerp_(grad.float().square().mean(dim=-2, keepdim=True), 1 - col_beta2)
+        col_power = 0.25 if grad.size(-2) < grad.size(-1) else 0.125
+        grad = grad / (col_variance.pow(col_power) + 1e-8)
+    else:
+        variance.lerp_(grad.float().square().mean(dim=-1, keepdim=True), 1 - attn_beta2)
+        grad = grad / (variance.pow(0.0625) + 1e-8)
     momentum.lerp_(grad, 1 - mu)
-    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = grad.lerp_(momentum, nesterov_mu)
     update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    aspect = max(grad.size(-2), grad.size(-1)) / min(grad.size(-2), grad.size(-1))
+    update *= aspect**0.5
     return update
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        defaults = dict(lr=lr, weight_decay=weight_decay,
+                        mu=torch.tensor(mu, device=params[0].device),
+                        mlp_mu=torch.tensor(mu, device=params[0].device),
+                        nesterov_mu=torch.tensor(mu, device=params[0].device),
+                        precond_beta2=torch.tensor(0.95, device=params[0].device),
+                        col_beta2=torch.tensor(0.95, device=params[0].device),
+                        attn_beta2=torch.tensor(0.99, device=params[0].device),
+                        mlp_decay_scale=1.6, wide_decay_scale=1.6,
+                        attn_decay_scale=0.90, qk_decay_offset=0.15)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -206,9 +229,25 @@ class Muon(torch.optim.Optimizer):
                     p = params[base_i + rank]
                     state = self.state[p]
                     if len(state) == 0:
-                        state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                        state["momentum"] = p.grad.detach().clone()
+                        state["variance"] = torch.zeros((*p.shape[:-1], 1), device=p.device)
+                        state["col_variance"] = torch.zeros((*p.shape[:-2], 1, p.shape[-1]), device=p.device)
+                    mu = group["mlp_mu"] if p.size(-2) != p.size(-1) else group["mu"]
+                    update = muon_update(p.grad, state["momentum"], state["variance"],
+                                         state["col_variance"], mu=mu,
+                                         beta2=group["precond_beta2"],
+                                         col_beta2=group["col_beta2"],
+                                         attn_beta2=group["attn_beta2"],
+                                         nesterov_mu=group["nesterov_mu"])
+                    if p.size(-2) < p.size(-1):
+                        decay_scale = group["wide_decay_scale"]
+                    elif p.size(-2) > p.size(-1):
+                        decay_scale = group["mlp_decay_scale"]
+                    else:
+                        decay_scale = group["attn_decay_scale"]
+                        if p._qk_decay_role:
+                            decay_scale += group["qk_decay_offset"]
+                    p.mul_(1 - group["lr"] * group["weight_decay"] * decay_scale)
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
@@ -278,7 +317,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3042
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -289,7 +328,7 @@ for trial_idx in range(num_trials):
             elif "embed" in name:
                 w.normal_()  # default torch init
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -298,18 +337,25 @@ for trial_idx in range(num_trials):
             raise Exception(f"Uninitialized parameter: {name}")
 
     # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7,
+                             betas=(0.81, 0.98)),
                         dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
-    optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
+                       betas=(0.80, 0.98), eps=1e-10, weight_decay=0.001, fused=True)
+    block_matrix_params = []
+    for name, p in model.blocks.named_parameters():
+        if p.ndim >= 2:
+            p._qk_decay_role = ".attn.q.weight" in name or ".attn.k.weight" in name
+            block_matrix_params.append(p)
+    optimizer2 = Muon(block_matrix_params,
+                      lr=0.025, weight_decay=0.05, mu=0.95)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
+            group["initial_weight_decay"] = group["weight_decay"]
 
     # W&B run for this trial (fixed logging infra; no-op if W&B unconfigured)
     wandb_run = None
@@ -333,9 +379,21 @@ for trial_idx in range(num_trials):
             eta = 1.0
         else:
             eta = (1 - progress) / cooldown_frac
+        cooldown = 1 - eta
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
+                if "mu" in group:
+                    group["mu"].fill_(0.95 - 0.05 * cooldown**2)
+                    group["mlp_mu"].copy_(group["mu"])
+                    group["nesterov_mu"].copy_(group["mu"])
+                    group["precond_beta2"].fill_(0.95 - 0.02 * cooldown**2)
+                    group["col_beta2"].fill_(0.95 - 0.02 * cooldown**2)
+                    group["weight_decay"] = group["initial_weight_decay"] * (1 - 0.4 * cooldown**2)
+                    group["mlp_decay_scale"] = 1.6 - 0.4 * cooldown**2
+                    group["wide_decay_scale"] = 1.6 - 0.4 * cooldown**2
+                    group["attn_decay_scale"] = 0.9 - 0.1 * cooldown
+                    group["qk_decay_offset"] = 0.15
 
 
     ########################################
@@ -404,4 +462,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-
