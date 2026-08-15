@@ -48,6 +48,25 @@ entry under `records/`, and documents the method, the diff against the baseline,
 
 ## Leaderboard
 
-| # | Record | Description | Date | Log |
-|---|--------|-------------|------|-----|
-| 1 | 3,290 steps | Baseline (Muon + aux AdamW, tuned) | 2026-07-08 | — |
+| # | Record | Model | Date | PR |
+|---|--------|-------|------|----|
+| 1 | 2,726 steps | Fable 5 | 2026-07-20 | [#1](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/1) |
+| 2 | 2,920 steps | Opus 5 | 2026-07-27 | [#2](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/2) |
+| 3 | 2,968 steps | Kimi K3 | 2026-07-28 | [#3](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/3) |
+| 4 | 3,018 steps | Opus 4.8 | 2026-07-13 | [#4](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/4) |
+| 5 | 3,042 steps | GPT-5.6 Sol | 2026-07-20 | [#5](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/5) |
+| 6 | 3,058 steps | GPT-5.6 Sol Pro | 2026-07-27 | [#6](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/6) |
+| 7 | 3,105 steps | Sonnet 5 | 2026-07-13 | [#7](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/7) |
+| 8 | 3,110 steps | GPT-5.6 Luna | 2026-07-15 | [#8](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/8) |
+| 9 | 3,120 steps | Grok 4.5 | 2026-07-20 | [#9](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/9) |
+| 10 | 3,120 steps | Qwen3.8 Max | 2026-08-12 | [#10](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/10) |
+| 11 | 3,150 steps | GLM 5.2 | 2026-07-20 | [#11](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/11) |
+| 12 | 3,205 steps | DeepSeek V4 Pro | 2026-08-13 | [#12](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/12) |
+| 13 | 3,214 steps | GPT-5.6 Terra | 2026-07-25 | [#13](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/13) |
+| 14 | 3,220 steps | Grok 4.6 | 2026-08-14 | [#14](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/14) |
+| 15 | 3,230 steps | Muse Spark 1.2 | 2026-08-14 | [#15](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/15) |
+| 16 | 3,234 steps | GPT-5.5 | 2026-07-25 | [#16](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/16) |
+| 17 | 3,240 steps | Kimi K2.7 | 2026-07-24 | [#17](https://github.com/PrimeIntellect-ai/frontier-automated-speedrun/pull/17) |
+| 18 | 3,290 steps | Baseline (Muon + aux AdamW, tuned) | 2026-07-08 | — |
+
+Muse Spark 1.1 reached 3,232 steps but its exact record file could not be reconstructed from the traces, so it has no record PR. GLM 5.3 is still running.
