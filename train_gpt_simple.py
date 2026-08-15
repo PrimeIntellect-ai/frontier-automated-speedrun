@@ -188,10 +188,11 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     return update
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95, wd_exponent=1.0, flat_wd_boost=1.0):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu, wd_exponent=wd_exponent,
+                        flat_wd_boost=flat_wd_boost)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -208,9 +209,48 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum"], mu=group["mu"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    eta = group["lr"] / group["initial_lr"]
+                    boost = group["flat_wd_boost"] if eta >= 1.0 else 1.0
+                    p.mul_(1 - group["initial_lr"] * group["weight_decay"] * eta**group["wd_exponent"] * boost)
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+
+class EmbedAdamW(torch.optim.Optimizer):
+    """AdamW with an explicit fp32 master weight + fp32 optimizer state, for bf16-stored
+    parameters (embed.weight). Stock AdamW's exp_avg/exp_avg_sq inherit the parameter's own
+    dtype, so for a bf16 parameter the second-moment accumulator only has ~8 bits of mantissa,
+    silently losing small per-step increments. This keeps the accumulation in fp32 and casts
+    back to the parameter's dtype only for the forward pass."""
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state["master"] = p.detach().clone().float()
+                    state["exp_avg"] = torch.zeros_like(state["master"])
+                    state["exp_avg_sq"] = torch.zeros_like(state["master"])
+                    state["step"] = 0
+                state["step"] += 1
+                grad = p.grad.float()
+                state["exp_avg"].lerp_(grad, 1 - beta1)
+                state["exp_avg_sq"].lerp_(grad.square(), 1 - beta2)
+                bias_correction1 = 1 - beta1 ** state["step"]
+                bias_correction2 = 1 - beta2 ** state["step"]
+                m_hat = state["exp_avg"] / bias_correction1
+                v_hat = state["exp_avg_sq"] / bias_correction2
+                update = m_hat / (v_hat.sqrt() + group["eps"])
+                state["master"].mul_(1 - group["lr"] * group["weight_decay"])
+                state["master"].add_(update, alpha=-group["lr"])
+                p.data.copy_(state["master"])
 
 
 ########################################
@@ -278,7 +318,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3105
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -298,13 +338,13 @@ for trial_idx in range(num_trials):
             raise Exception(f"Uninitialized parameter: {name}")
 
     # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
+    optimizer1 = AdamW([dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+                       betas=(0.8, 0.98), eps=1e-10, weight_decay=0.001, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
-    optimizers = [optimizer1, optimizer2]
+                      lr=0.025, weight_decay=0.08, wd_exponent=3.0, flat_wd_boost=1.25)
+    optimizer3 = EmbedAdamW([model.embed.weight], lr=0.7, betas=(0.8, 0.98), eps=1e-10, weight_decay=0.001)
+    optimizers = [optimizer1, optimizer2, optimizer3]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
@@ -404,4 +444,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-
