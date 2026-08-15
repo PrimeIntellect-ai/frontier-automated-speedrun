@@ -212,7 +212,6 @@ class Muon(torch.optim.Optimizer):
                     p.add_(update, alpha=-group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
-
 ########################################
 #                Setup                 #
 ########################################
@@ -278,7 +277,8 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    # BANKED record: stock @ 3270, 8-trial mean 3.27825 (logs/000a247d-...).
+    train_steps = 3120
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -301,7 +301,7 @@ for trial_idx in range(num_trials):
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
                         dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+                       betas=(0.8, 0.98), eps=1e-10, weight_decay=0.001, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
                       lr=0.025, weight_decay=0.05)
     optimizers = [optimizer1, optimizer2]
@@ -326,16 +326,21 @@ for trial_idx in range(num_trials):
             wandb_run = None
 
     # learning rate schedule: stable then decay
-    def set_hparams(step, cooldown_frac=0.7):
+    def set_hparams(step, cooldown_frac=0.72):
         progress = step / train_steps
         assert 0 <= progress < 1
         if progress < 1 - cooldown_frac:
             eta = 1.0
+            wd_ramp = 0.0
         else:
             eta = (1 - progress) / cooldown_frac
+            wd_ramp = (progress - (1 - cooldown_frac)) / cooldown_frac
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
+                if opt is optimizer2:
+                    # heavier Muon wd in the stable phase, tapering through the decay
+                    group["weight_decay"] = 0.08 - 0.16 * wd_ramp
 
 
     ########################################
@@ -404,4 +409,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-
