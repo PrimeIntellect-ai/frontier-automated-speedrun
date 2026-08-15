@@ -180,12 +180,60 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     return X
 
 @torch.compile
-def muon_update(grad, momentum, mu=0.95, nesterov=True):
+def muon_update(grad, momentum, row_variance_ema, col_variance_ema,
+                mu=0.95, beta2=0.80, col_beta2=0.80, nesterov=True):
     momentum.lerp_(grad, 1 - mu)
     update = grad.lerp_(momentum, mu) if nesterov else momentum
     update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    row_variance = update.float().square().mean(dim=-1, keepdim=True)
+    row_variance_ema.lerp_(row_variance, 1 - beta2)
+    update *= (row_variance_ema.rsqrt() / grad.size(-1)**0.5).to(update.dtype)
+    if grad.size(-2) > grad.size(-1):
+        col_variance = update.float().square().mean(dim=-2, keepdim=True)
+        col_variance_ema.lerp_(col_variance, 1 - col_beta2)
+        update *= (col_variance_ema.rsqrt() / grad.size(-1)**0.5).to(update.dtype)
     return update
+
+@torch.compile
+def scheduled_adamw_update(param, grad, exp_avg, exp_avg_sq, step, beta2_prod,
+                           lr, beta2, beta1=0.8, eps=1e-10, weight_decay=0.001):
+    param.mul_(1 - lr * weight_decay)
+    exp_avg.lerp_(grad, 1 - beta1)
+    exp_avg_sq.mul_(beta2).add_(grad.square() * (1 - beta2))
+    step.add_(1)
+    beta2_prod.mul_(beta2)
+    bias1 = 1 - beta1**step
+    bias2 = 1 - beta2_prod
+    denom = exp_avg_sq.sqrt() / bias2.sqrt() + eps
+    param.add_(exp_avg / denom * (-lr / bias1))
+
+class ScheduledAdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.004, beta1=0.8, beta2=0.99,
+                 eps=1e-10, weight_decay=0.001):
+        defaults = dict(lr=lr, beta1=beta1, beta2=beta2,
+                        eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            device = group["params"][0].device
+            group["lr"] = torch.tensor(lr, device=device)
+            group["beta1"] = torch.tensor(beta1, device=device)
+            group["beta2"] = torch.tensor(beta2, device=device)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["step"] = torch.zeros((), device=p.device)
+                    state["beta2_prod"] = torch.ones((), device=p.device)
+                scheduled_adamw_update(
+                    p, p.grad, state["exp_avg"], state["exp_avg_sq"], state["step"],
+                    state["beta2_prod"], group["lr"], group["beta2"],
+                    beta1=group["beta1"], eps=group["eps"],
+                    weight_decay=group["weight_decay"])
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
@@ -207,9 +255,17 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                        state["row_variance"] = torch.full(
+                            (p.size(0), 1), 1 / max(p.size()), device=p.device, dtype=torch.float32)
+                        state["col_variance"] = torch.full(
+                            (1, p.size(1)), 1 / p.size(1), device=p.device, dtype=torch.float32)
+                    mu = (group["tall_mu"] if p.size(0) > p.size(1) else
+                          group["wide_mu"] if p.size(0) < p.size(1) else group["mu"])
+                    update = muon_update(p.grad, state["momentum"], state["row_variance"],
+                                         state["col_variance"], mu=mu)
+                    lr = group["tall_lr"] if p.size(0) > p.size(1) else group["lr"]
+                    p.mul_(1 - lr * group["weight_decay"])
+                    p.add_(update, alpha=-lr)
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
@@ -278,18 +334,21 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3058
 
     # initialize model parameters
     for name, p in model.named_parameters():
         w = p.data
         if name.endswith("weight"):
-            if "proj" in name:
+            if name == "proj.weight":
+                torch.nn.init.orthogonal_(
+                    w, gain=0.20 * (0.33 * w.size(0) / w.size(1))**0.5)
+            elif "proj" in name:
                 w.zero_()
             elif "embed" in name:
-                w.normal_()  # default torch init
+                w.normal_()
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -298,18 +357,22 @@ for trial_idx in range(num_trials):
             raise Exception(f"Uninitialized parameter: {name}")
 
     # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.70),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+    optimizer_proj = ScheduledAdamW([model.proj.weight])
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
-    optimizers = [optimizer1, optimizer2]
+                      lr=0.026, weight_decay=0.05)
+    for group in optimizer2.param_groups:
+        group["mu"] = torch.tensor(0.85, device=device)
+        group["tall_mu"] = torch.tensor(0.85, device=device)
+        group["wide_mu"] = torch.tensor(0.85, device=device)
+    optimizers = [optimizer1, optimizer_proj, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
         for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
+            group["initial_lr"] = float(group["lr"])
 
     # W&B run for this trial (fixed logging infra; no-op if W&B unconfigured)
     wandb_run = None
@@ -326,16 +389,32 @@ for trial_idx in range(num_trials):
             wandb_run = None
 
     # learning rate schedule: stable then decay
-    def set_hparams(step, cooldown_frac=0.7):
-        progress = step / train_steps
+    def set_hparams(step, cooldown_frac=0.70, schedule_steps=3135):
+        progress = step / schedule_steps
         assert 0 <= progress < 1
         if progress < 1 - cooldown_frac:
             eta = 1.0
         else:
             eta = (1 - progress) / cooldown_frac
         for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+            for group_idx, group in enumerate(opt.param_groups):
+                if opt is optimizer2:
+                    opt_eta = eta**1.25
+                else:
+                    opt_eta = eta
+                if opt is optimizer_proj:
+                    group["lr"].fill_(group["initial_lr"] * opt_eta)
+                else:
+                    group["lr"] = group["initial_lr"] * opt_eta
+                if opt is optimizer2:
+                    group["tall_lr"] = 0.028 * eta**1.25
+        for group in optimizer_proj.param_groups:
+            group["beta1"].fill_(0.80)
+            group["beta2"].fill_(0.95 + 0.04 * min(step / 400, 1))
+        for group in optimizer2.param_groups:
+            group["mu"].fill_(0.85 + 0.115 * min(step / 600, 1))
+            group["tall_mu"].fill_(0.85 + 0.120 * min(step / 600, 1))
+            group["wide_mu"].fill_(0.85 + 0.115 * min(step / 600, 1))
 
 
     ########################################
