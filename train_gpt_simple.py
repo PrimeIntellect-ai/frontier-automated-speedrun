@@ -187,12 +187,18 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
+ATTN_LR_SCALE = 0.8  # decoupled Muon lr: attn (square) lr ×0.8 = 0.02
+MLP_LR_SCALE = 1.4   # decoupled Muon lr: mlp (rectangular) lr ×1.4 = 0.035
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
         super().__init__(params, defaults)
+        # store mu as a 0-dim tensor so a per-step momentum schedule doesn't retrigger compiles
+        for group in self.param_groups:
+            group["mu"] = torch.tensor(float(group["mu"]), device=group["params"][0].device)
 
     @torch.no_grad()
     def step(self):
@@ -208,8 +214,9 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum"], mu=group["mu"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    lr_p = group["lr"] * (ATTN_LR_SCALE if p.size(-2) == p.size(-1) else MLP_LR_SCALE)  # square=attn, rect=mlp
+                    p.mul_(1 - lr_p * group["weight_decay"])
+                    p.add_(update, alpha=-lr_p)
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
@@ -278,7 +285,7 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3018  # RECORD (confirmed run 134 + re-confirmed run 156; logs a2498176, 3081edca)
 
     # initialize model parameters
     for name, p in model.named_parameters():
@@ -289,7 +296,8 @@ for trial_idx in range(num_trials):
             elif "embed" in name:
                 w.normal_()  # default torch init
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                factor = 1.0 if "attn.v" in name else 0.66  # v (linear path) wants bigger init than ReLU2 fc; q/k=1.0 was seed-0 artifact (neutral n=8)
+                w.normal_(std=factor**0.5 / w.size(-1)**0.5)
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -299,11 +307,11 @@ for trial_idx in range(num_trials):
 
     # create the optimizer(s)
     optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
-                        dict(params=[model.proj.weight], lr=0.004),
+                        dict(params=[model.proj.weight], lr=0.004),  # head lr 0.004 optimal (0.003 & 0.006 both worse)
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
-                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
+                       betas=(0.8, 0.98), eps=1e-10, weight_decay=0.001, fused=True)  # beta1 0.8 (0.9 neutral); beta2 overridden per-step by rising schedule
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
+                      lr=0.025, weight_decay=0.06)  # wd 0.06 optimal (0.04 & 0.08 both worse, clean peak)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
@@ -325,17 +333,33 @@ for trial_idx in range(num_trials):
             print0(f"wandb disabled: {e}", console=True)
             wandb_run = None
 
-    # learning rate schedule: stable then decay
-    def set_hparams(step, cooldown_frac=0.7):
+    # schedule: stable then decay (no LR warmup); plus a Muon momentum warmup (mu 0.85->0.95)
+    def set_hparams(step, cooldown_frac=0.8, mu_warmup_frac=0.1, mu_hold_end=0.5):
         progress = step / train_steps
         assert 0 <= progress < 1
         if progress < 1 - cooldown_frac:
             eta = 1.0
         else:
-            eta = (1 - progress) / cooldown_frac
+            eta = (1 - progress) / cooldown_frac  # linear decay strongly optimal (cosine 5σ, quadratic 12σ worse)
+        # Muon momentum schedule: warmup 0.85->0.97 (first mu_warmup_frac), hold 0.97 until
+        # mu_hold_end, then decrease 0.97->0.90 (high momentum mid-run, drop lag near the end)
+        mu_peak = 0.97  # peak 0.97 optimal (0.96 & 0.98 both worse, clean peak)
+        if progress < mu_warmup_frac:
+            mu_val = 0.85 + (mu_peak - 0.85) * (progress / mu_warmup_frac)  # warmup 0.85->peak
+        elif progress < mu_hold_end:
+            mu_val = mu_peak
+        else:
+            u = (progress - mu_hold_end) / (1 - mu_hold_end)
+            mu_val = mu_peak - (mu_peak - 0.90) * u  # decrease peak->0.90
+        beta2_sched = 0.97 + 0.02 * progress  # beta2 0.97->0.99 (start 0.95 & end 0.995 both worse; optimal)
         for opt in optimizers:
+            e = (0.1 + 0.9 * eta) if opt is optimizer1 else eta  # Adam (embed/head/scalars) floored at 0.1; blocks anneal to 0 (floor worse)
             for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * eta
+                group["lr"] = group["initial_lr"] * e
+                if "mu" in group:
+                    group["mu"].fill_(mu_val)
+                if opt is optimizer1:
+                    group["betas"] = (group["betas"][0], beta2_sched)
 
 
     ########################################
