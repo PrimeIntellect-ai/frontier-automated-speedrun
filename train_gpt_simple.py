@@ -169,8 +169,9 @@ def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations, not optimizing for wallclock speed
+    # 21 iterations; probing NS21/init0.55 at 3240 steps.
     a, b, c = 2, -1.5, 0.5
-    for _ in range(12):
+    for _ in range(21):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -278,9 +279,10 @@ for trial_idx in range(num_trials):
 
     # Minimize this while the 8-trial mean still clears the bar (< 3.27859).
     # Baseline anchor: the stock recipe clears the bar at 3290 (confirm with `bash run.sh 8`).
-    train_steps = 3290
+    train_steps = 3240
 
     # initialize model parameters
+    init_std_constant = 0.55
     for name, p in model.named_parameters():
         w = p.data
         if name.endswith("weight"):
@@ -289,7 +291,7 @@ for trial_idx in range(num_trials):
             elif "embed" in name:
                 w.normal_()  # default torch init
             else:
-                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+                w.normal_(std=init_std_constant**0.5 / w.size(-1)**0.5)  # default torch init
         elif name.endswith("bias"):
             w.zero_()
         elif name.endswith("gains"):
@@ -298,12 +300,13 @@ for trial_idx in range(num_trials):
             raise Exception(f"Uninitialized parameter: {name}")
 
     # create the optimizer(s)
-    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.7),
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=1.0),
+
                         dict(params=[model.proj.weight], lr=0.004),
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.015)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0.001, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.05)
+                      lr=0.025, mu=0.95, weight_decay=0.05)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())
@@ -326,13 +329,16 @@ for trial_idx in range(num_trials):
             wandb_run = None
 
     # learning rate schedule: stable then decay
-    def set_hparams(step, cooldown_frac=0.7):
+    def set_hparams(step, cooldown_frac=0.7, warmup_frac=0.0, eta_min=0.0):
         progress = step / train_steps
         assert 0 <= progress < 1
-        if progress < 1 - cooldown_frac:
+        if progress < warmup_frac:
+            eta = progress / warmup_frac
+        elif progress < 1 - cooldown_frac:
             eta = 1.0
         else:
-            eta = (1 - progress) / cooldown_frac
+            eta = eta_min + (1 - eta_min) * (1 - progress) / cooldown_frac
+
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * eta
@@ -391,7 +397,7 @@ for trial_idx in range(num_trials):
             assert p.grad is not None, name
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
         # set optimization hyperparameters and take a step
-        set_hparams(step)
+        set_hparams(step, cooldown_frac=0.7)
         for opt in optimizers:
             opt.step()
         model.zero_grad(set_to_none=True)
@@ -404,4 +410,3 @@ for trial_idx in range(num_trials):
         wandb_run.finish()
 
 dist.destroy_process_group()
-
