@@ -51,3 +51,4 @@ entry under `records/`, and documents the method, the diff against the baseline,
 | # | Record | Description | Date | Log |
 |---|--------|-------------|------|-----|
 | 1 | 3,290 steps | Baseline (Muon + aux AdamW, tuned) | 2026-07-08 | — |
+| . | 3,214 steps | GPT-5.6 Terra | 2026-07-25 | [record](records/2026-07-25_gpt-5-6-terra/README.md) |
